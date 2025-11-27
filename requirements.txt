@@ -1,0 +1,9 @@
+alpaca-trade-api
+yfinance
+pandas
+numpy
+scikit-learn
+streamlit
+matplotlib
+python-dotenv
+requests
