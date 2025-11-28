@@ -15,8 +15,7 @@ from sklearn.metrics import accuracy_score
 
 from alpaca_trade_api import REST, TimeFrame
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
-
+from sqlalchemy import create_engine, text
 
 
 # ==============================
@@ -29,7 +28,8 @@ load_dotenv()
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-# NEW: Database connection
+
+# Database connection
 DB_URL = os.getenv("DB_URL")
 engine = create_engine(DB_URL)
 
@@ -38,14 +38,11 @@ SYMBOLS = ["AAPL", "MSFT", "GOOGL"]  # you can change/add
 
 DATA_LOOKBACK_DAYS = 365 * 3        # 3 years of history for model
 TRAIN_RATIO = 0.7
-PROB_THRESHOLD = 0.50               # LOWERED: min prob to go long
+PROB_THRESHOLD = 0.50               # min prob to go long
 
 STOP_LOSS_PCT = 0.02                # 2% SL
 TAKE_PROFIT_PCT = 0.04              # 4% TP
 RUN_INTERVAL_SECONDS = 60 * 5       # run every 5 minutes
-
-TRADES_CSV = "trades_log.csv"
-EQUITY_CSV = "equity_log.csv"
 
 INITIAL_EQUITY_ASSUMED = 10000.0    # used only if equity log is empty
 RISK_PER_TRADE_PCT = 0.02           # risk 2% of equity per trade
@@ -81,6 +78,44 @@ print(
     "| secret set =", bool(ALPACA_SECRET_KEY),
     "| telegram =", TELEGRAM_ENABLED,
 )
+
+
+# ==============================
+# DB INITIALIZATION
+# ==============================
+
+def initialize_database():
+    """Create trades and equity tables if they don't exist."""
+    create_trades_table = """
+    CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER,
+        timestamp TEXT,
+        symbol TEXT,
+        side TEXT,
+        qty INTEGER,
+        entry_price DOUBLE PRECISION,
+        stop_loss DOUBLE PRECISION,
+        take_profit DOUBLE PRECISION,
+        status TEXT,
+        exit_price DOUBLE PRECISION,
+        pnl DOUBLE PRECISION,
+        reason TEXT
+    );
+    """
+
+    create_equity_table = """
+    CREATE TABLE IF NOT EXISTS equity (
+        timestamp TEXT,
+        equity DOUBLE PRECISION
+    );
+    """
+
+    with engine.connect() as conn:
+        conn.execute(text(create_trades_table))
+        conn.execute(text(create_equity_table))
+        conn.commit()
+
+    print("📌 Database tables verified/created (trades, equity).")
 
 
 # ==============================
@@ -194,83 +229,51 @@ def train_model_and_signal(df: pd.DataFrame, prob_threshold=0.6):
     latest_row = df.iloc[-1].copy()
     latest_signal = int(prob_up_latest > prob_threshold)
 
-    # ---------- FALLBACK LOGIC ----------
-    # 1) Force BUY if RSI14 is oversold
-    # ---------- FALLBACK LOGIC (fixed) ----------
+    # ---------- FALLBACK LOGIC (fixed, no FutureWarning) ----------
+    rsi_val = latest_row["RSI14"]
+    close_val = latest_row["Close"]
+    sma50_val = latest_row["SMA50"]
+
+    if hasattr(rsi_val, "iloc"):
+        rsi_val = rsi_val.iloc[0]
+    if hasattr(close_val, "iloc"):
+        close_val = close_val.iloc[0]
+    if hasattr(sma50_val, "iloc"):
+        sma50_val = sma50_val.iloc[0]
+
     if latest_signal == 0:
-        # Rule 1 — RSI Oversold
-        if float(latest_row["RSI14"]) < 30:
+        if rsi_val < 30:
             latest_signal = 1
             print("⚠️ FORCED BUY — RSI14 < 30 (oversold)")
-
-        # Rule 2 — near-threshold probability + price above trend
-        elif (prob_up_latest > (prob_threshold - 0.08)) and (float(latest_row["Close"]) > float(latest_row["SMA50"])):
+        elif (prob_up_latest > (prob_threshold - 0.08)) and (close_val > sma50_val):
             latest_signal = 1
             print("📈 FORCED BUY — ProbUp borderline + Close > SMA50")
-
         else:
             print(f"⏸ No trade — ProbUp={prob_up_latest:.2%}, Threshold={prob_threshold:.2%}")
-
 
     return prob_up_latest, latest_signal, latest_row, acc
 
 
 # ==============================
-# ALPACA + TRADE LOGGING
+# ALPACA + TRADE LOGGING (DB)
 # ==============================
 
 class AlpacaPaperBroker:
     def __init__(self,
                  api_key=ALPACA_API_KEY,
                  secret_key=ALPACA_SECRET_KEY,
-                 base_url=ALPACA_BASE_URL,
-                 trades_csv=TRADES_CSV,
-                 equity_csv=EQUITY_CSV):
+                 base_url=ALPACA_BASE_URL):
 
         self.api = REST(api_key, secret_key, base_url=base_url)
-        self.trades_csv = trades_csv
-        self.equity_csv = equity_csv
 
-        # ensure CSVs exist
-        if not os.path.exists(self.trades_csv):
-            pd.DataFrame(columns=[
-                "timestamp", "symbol", "side", "qty", "entry_price",
-                "stop_loss", "take_profit", "status", "exit_price",
-                "pnl", "reason"
-            ]).to_csv(self.trades_csv, index=False)
+    # ----- Positions & price -----
 
-        if not os.path.exists(self.equity_csv):
-            pd.DataFrame(columns=["timestamp", "equity"]).to_csv(self.equity_csv, index=False)
-
-    # ----- CSV helpers -----
-    def load_trades(self):
-        return pd.read_csv(self.trades_csv)
-
-    def save_trades(self, df):
-        df.to_csv(self.trades_csv, index=False)
-
-    def get_open_positions_log(self):
-        df = self.load_trades()
-        if df.empty:
-            return pd.DataFrame(columns=df.columns)
-        return df[df["status"] == "open"].copy()
-
-    def current_open_trade_for_symbol(self, symbol):
-        opens = self.get_open_positions_log()
-        sym = opens[opens["symbol"] == symbol]
-        if sym.empty:
-            return None
-        # latest open trade
-        return sym.iloc[-1]
-
-    # ----- Market data via Alpaca -----
     def get_last_price(self, symbol):
         bars = self.api.get_bars(symbol, TimeFrame.Minute, limit=1)
         if len(bars) == 0:
             return None
         return float(bars[0].c)
 
-    # ----- Positions via Alpaca -----
     def alpaca_position_qty(self, symbol):
         try:
             pos = self.api.get_position(symbol)
@@ -278,9 +281,59 @@ class AlpacaPaperBroker:
         except Exception:
             return 0.0
 
+    # ----- Open trades from DB -----
+
+    def get_open_positions_log(self):
+        try:
+            df = pd.read_sql("SELECT * FROM trades", engine)
+        except Exception as e:
+            print("No trades table yet or DB error in get_open_positions_log:", e)
+            return pd.DataFrame(columns=[
+                "id", "timestamp", "symbol", "side", "qty", "entry_price",
+                "stop_loss", "take_profit", "status", "exit_price",
+                "pnl", "reason"
+            ])
+
+        if df.empty:
+            return df
+
+        return df[df["status"] == "open"].copy()
+
+    def current_open_trade_for_symbol(self, symbol):
+        df = self.get_open_positions_log()
+        if df.empty:
+            return None
+
+        sym_df = df[df["symbol"] == symbol]
+        if sym_df.empty:
+            return None
+
+        sym_df["timestamp"] = pd.to_datetime(sym_df["timestamp"])
+        sym_df = sym_df.sort_values("timestamp")
+        return sym_df.iloc[-1]  # returns a Series with an 'id' column if present
+
     # ----- Orders + logging -----
+
+    def _next_trade_id(self):
+        try:
+            df = pd.read_sql("SELECT id FROM trades", engine)
+            if df.empty or "id" not in df.columns:
+                return 1
+            return int(df["id"].max()) + 1
+        except Exception:
+            return 1
+
     def log_new_trade(self, symbol, side, qty, entry_price, stop_loss, take_profit, reason="entry"):
         qty = int(qty)
+
+        # Safety clamp to avoid huge orders / insufficient buying power
+        if qty <= 0:
+            print("❌ Computed qty is 0, skipping trade.")
+            return
+        if qty > 5:
+            print(f"⚠️ Qty {qty} too large, clamping to 5.")
+            qty = 5
+
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         # Place Alpaca market order
@@ -302,8 +355,10 @@ class AlpacaPaperBroker:
         else:
             return  # (No short selling yet)
 
-        # ---- NEW: Save to PostgreSQL instead of CSV ----
+        # Generate ID & save to DB
+        trade_id = self._next_trade_id()
         trade_record = pd.DataFrame([{
+            "id": trade_id,
             "timestamp": ts,
             "symbol": symbol,
             "side": side,
@@ -320,7 +375,6 @@ class AlpacaPaperBroker:
         trade_record.to_sql("trades", engine, if_exists="append", index=False)
         print("📌 Trade saved in PostgreSQL database")
 
-        # Notification message
         msg = (
             f"🟢 *NEW TRADE OPENED*\n"
             f"• Symbol: `{symbol}`\n"
@@ -329,19 +383,28 @@ class AlpacaPaperBroker:
             f"• SL: `${stop_loss:.2f}` | TP: `${take_profit:.2f}`\n"
             f"• Time: `{ts}`\n"
         )
-
         send_telegram_message(msg)
         send_email("Bot Trade Executed", msg)
 
-    def close_trade(self, trade_index, exit_price, reason="exit"):
-    # Read trades from DB
-        df = pd.read_sql("SELECT * FROM trades", engine)
-
-        if trade_index >= len(df):
-            print("⚠️ Trade index not found in database.")
+    def close_trade(self, trade_id, exit_price, reason="exit"):
+        # Read trades from DB
+        try:
+            df = pd.read_sql("SELECT * FROM trades", engine)
+        except Exception as e:
+            print("⚠️ No trades table yet, cannot close trade. Error:", e)
             return
 
-        row = df.loc[trade_index]
+        if df.empty or "id" not in df.columns:
+            print("⚠️ No trades to close in DB.")
+            return
+
+        mask = df["id"] == trade_id
+        if not mask.any():
+            print(f"⚠️ Trade with id={trade_id} not found in DB.")
+            return
+
+        idx = df.index[mask][0]
+        row = df.loc[idx]
 
         if row["status"] != "open":
             print("⚠️ Trade is already closed.")
@@ -374,17 +437,14 @@ class AlpacaPaperBroker:
             pnl = (row["entry_price"] - exit_price) * row["qty"]
 
         # ---- Update record in DB ----
-        df.loc[trade_index, "status"] = "closed"
-        df.loc[trade_index, "exit_price"] = float(exit_price)
-        df.loc[trade_index, "pnl"] = float(pnl)
-        df.loc[trade_index, "reason"] = reason
+        df.loc[idx, "status"] = "closed"
+        df.loc[idx, "exit_price"] = float(exit_price)
+        df.loc[idx, "pnl"] = float(pnl)
+        df.loc[idx, "reason"] = reason
 
-        # Save back to DB (replace entire table)
         df.to_sql("trades", engine, if_exists="replace", index=False)
 
-        # ---- Alerts ----
         status_emoji = "🟢" if pnl >= 0 else "⚠️"
-
         msg = (
             f"{status_emoji} *TRADE CLOSED*\n"
             f"• Symbol: `{symbol}`\n"
@@ -393,11 +453,9 @@ class AlpacaPaperBroker:
             f"• Reason: `{reason}`\n"
             f"• Profit/Loss: `${pnl:.2f}`"
         )
-
         print(msg)
         send_telegram_message(msg)
         send_email("Trade Closed", msg)
-
 
     def get_equity(self):
         try:
@@ -408,28 +466,21 @@ class AlpacaPaperBroker:
             return INITIAL_EQUITY_ASSUMED
 
     def log_equity(self):
-    # Get current equity from Alpaca
         equity = self.get_equity()
-
-        # UTC timestamp string
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-        # Create one-row DataFrame
         row = pd.DataFrame([{
             "timestamp": ts,
             "equity": float(equity),
         }])
 
-        # Append to "equity" table in PostgreSQL
         row.to_sql("equity", engine, if_exists="append", index=False)
-
         print(f"[EQUITY LOGGED to DB] {ts} => {equity:.2f}")
         return equity
 
 
-
 # ==============================
-# RISK / ALERT HELPERS
+# RISK / ALERT HELPERS (DB-BASED)
 # ==============================
 
 def check_risk_and_alert():
@@ -437,8 +488,9 @@ def check_risk_and_alert():
     global RISK_ALERT_TRIGGERED
 
     try:
-        df = pd.read_csv(EQUITY_CSV)
-    except FileNotFoundError:
+        df = pd.read_sql("SELECT * FROM equity", engine)
+    except Exception as e:
+        print("No equity table yet or DB error in check_risk_and_alert:", e)
         return
 
     if df.empty or "equity" not in df.columns:
@@ -465,7 +517,7 @@ def check_risk_and_alert():
         send_email("Bot Risk Alert", msg)
         RISK_ALERT_TRIGGERED = True
 
-    # Optional: reset alert flag if equity recovers near peak
+    # reset alert if recovered
     if drawdown > -RISK_ALERT_DRAWDOWN_PCT / 2:
         RISK_ALERT_TRIGGERED = False
 
@@ -480,24 +532,22 @@ def maybe_send_daily_summary():
     now_utc = datetime.now(timezone.utc)
     today = now_utc.date()
 
-    # Only after certain hour & only once per day
     if now_utc.hour < DAILY_SUMMARY_UTC_HOUR:
         return
     if LAST_SUMMARY_DATE == today:
         return
 
-    # Load trades & equity
+    # Load trades & equity from DB
     try:
-        trades = pd.read_csv(TRADES_CSV)
-    except FileNotFoundError:
+        trades = pd.read_sql("SELECT * FROM trades", engine)
+    except Exception:
         trades = pd.DataFrame()
 
     try:
-        equity = pd.read_csv(EQUITY_CSV)
-    except FileNotFoundError:
+        equity = pd.read_sql("SELECT * FROM equity", engine)
+    except Exception:
         equity = pd.DataFrame()
 
-    # Process today's closed trades
     daily_pnl = 0.0
     win_count = 0
     loss_count = 0
@@ -553,10 +603,10 @@ def maybe_send_heartbeat():
 
     latest_equity = None
     try:
-        eq_df = pd.read_csv(EQUITY_CSV)
-        if not eq_df.empty:
-            latest_equity = float(eq_df["equity"].iloc[-1])
-    except FileNotFoundError:
+        df = pd.read_sql("SELECT * FROM equity ORDER BY timestamp DESC LIMIT 1", engine)
+        if not df.empty:
+            latest_equity = float(df["equity"].iloc[0])
+    except Exception:
         pass
 
     eq_line = f"• Latest equity: `${latest_equity:.2f}`" if latest_equity is not None else "• Equity: N/A"
@@ -602,27 +652,29 @@ def run_cycle(symbols):
 
         print(f"Model acc={acc:.2%}, ProbUp={prob_up:.2%}, Signal={signal}, LastPrice={last_price:.2f}")
 
-        # 3. Check if we have an open trade in our log
+        # 3. Check open trade in DB
         open_trade = broker.current_open_trade_for_symbol(symbol)
         alpaca_qty = broker.alpaca_position_qty(symbol)
 
-        # If our log says open but Alpaca has 0 qty -> treat as closed mismatch
+        # If DB says open but Alpaca has 0 qty -> treat as closed mismatch
         if open_trade is not None and alpaca_qty <= 0:
-            broker.close_trade(open_trade.name, exit_price=last_price, reason="sync_mismatch")
+            trade_id = int(open_trade["id"])
+            broker.close_trade(trade_id, exit_price=last_price, reason="sync_mismatch")
             open_trade = None
 
         # 4. SL/TP handling for open trade
         if open_trade is not None:
-            sl = open_trade["stop_loss"]
-            tp = open_trade["take_profit"]
+            sl = float(open_trade["stop_loss"])
+            tp = float(open_trade["take_profit"])
             side = open_trade["side"]
+            trade_id = int(open_trade["id"])
 
             if side == "long":
                 if last_price <= sl:
-                    broker.close_trade(open_trade.name, exit_price=last_price, reason="stop_loss")
+                    broker.close_trade(trade_id, exit_price=last_price, reason="stop_loss")
                     open_trade = None
                 elif last_price >= tp:
-                    broker.close_trade(open_trade.name, exit_price=last_price, reason="take_profit")
+                    broker.close_trade(trade_id, exit_price=last_price, reason="take_profit")
                     open_trade = None
 
         # 5. Entry / exit by signal
@@ -650,8 +702,8 @@ def run_cycle(symbols):
             )
 
         elif signal == 0 and open_trade is not None:
-            # Flat signal -> close position
-            broker.close_trade(open_trade.name, exit_price=last_price, reason="signal_exit")
+            trade_id = int(open_trade["id"])
+            broker.close_trade(trade_id, exit_price=last_price, reason="signal_exit")
 
     # 6. Log equity after processing all symbols
     broker.log_equity()
@@ -680,8 +732,5 @@ def run_scheduler():
 
 
 if __name__ == "__main__":
-    # For testing one cycle:
-    # run_cycle(SYMBOLS)
-
-    # Continuous paper trading:
+    initialize_database()
     run_scheduler()
