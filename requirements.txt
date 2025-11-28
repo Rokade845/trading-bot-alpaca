@@ -7,3 +7,6 @@ streamlit
 matplotlib
 python-dotenv
 requests
+psycopg2-binary
+psycopg2
+sqlalchemy

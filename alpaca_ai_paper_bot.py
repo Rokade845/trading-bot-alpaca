@@ -15,6 +15,8 @@ from sklearn.metrics import accuracy_score
 
 from alpaca_trade_api import REST, TimeFrame
 from dotenv import load_dotenv
+from sqlalchemy import create_engine
+
 
 
 # ==============================
@@ -27,6 +29,9 @@ load_dotenv()
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+# NEW: Database connection
+DB_URL = os.getenv("DB_URL")
+engine = create_engine(DB_URL)
 
 # ---- Trading universe (US stocks supported by Alpaca) ----
 SYMBOLS = ["AAPL", "MSFT", "GOOGL"]  # you can change/add
@@ -293,94 +298,106 @@ class AlpacaPaperBroker:
                 print("❌ Alpaca submit_order BUY FAILED:", e)
                 send_telegram_message(f"❌ *BUY FAILED* for `{symbol}`\nReason: `{e}`")
                 send_email("Bot Alpaca BUY FAILED", f"{symbol}: {e}")
-                return  # don't log trade in CSV if order failed
+                return
         else:
-            # short selling not implemented here
-            return
+            return  # (No short selling yet)
 
-        # Log to CSV ONLY if order was sent successfully
-        df = self.load_trades()
-        new_row = {
+        # ---- NEW: Save to PostgreSQL instead of CSV ----
+        trade_record = pd.DataFrame([{
             "timestamp": ts,
             "symbol": symbol,
             "side": side,
             "qty": qty,
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
+            "entry_price": float(entry_price),
+            "stop_loss": float(stop_loss),
+            "take_profit": float(take_profit),
             "status": "open",
-            "exit_price": np.nan,
-            "pnl": np.nan,
-            "reason": reason,
-        }
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        self.save_trades(df)
+            "exit_price": None,
+            "pnl": None,
+            "reason": reason
+        }])
 
+        trade_record.to_sql("trades", engine, if_exists="append", index=False)
+        print("📌 Trade saved in PostgreSQL database")
+
+        # Notification message
         msg = (
             f"🟢 *NEW TRADE OPENED*\n"
             f"• Symbol: `{symbol}`\n"
-            f"• Side: *LONG*\n"
             f"• Qty: `{qty}`\n"
-            f"• Entry: `${entry_price:.2f}`\n"
-            f"• SL: `${stop_loss:.2f}`\n"
-            f"• TP: `${take_profit:.2f}`\n"
-            f"• Time (UTC): `{ts}`"
+            f"• Entry Price: `${entry_price:.2f}`\n"
+            f"• SL: `${stop_loss:.2f}` | TP: `${take_profit:.2f}`\n"
+            f"• Time: `{ts}`\n"
         )
-        print(msg)
+
         send_telegram_message(msg)
-        send_email("Bot new Alpaca trade", msg)
+        send_email("Bot Trade Executed", msg)
 
     def close_trade(self, trade_index, exit_price, reason="exit"):
-        df = self.load_trades()
+    # Read trades from DB
+        df = pd.read_sql("SELECT * FROM trades", engine)
+
+        if trade_index >= len(df):
+            print("⚠️ Trade index not found in database.")
+            return
+
         row = df.loc[trade_index]
+
         if row["status"] != "open":
+            print("⚠️ Trade is already closed.")
             return
 
         symbol = row["symbol"]
         qty = int(row["qty"])
         side = row["side"]
 
-        # Close via Alpaca
-        if side == "long":
-            try:
-                order = self.api.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side="sell",
-                    type="market",
-                    time_in_force="gtc"
-                )
-                print(f"Alpaca SELL sent: id={order.id}, status={order.status}")
-            except Exception as e:
-                print("❌ Alpaca submit_order SELL FAILED:", e)
-                send_telegram_message(f"❌ *SELL FAILED* for `{symbol}`\nReason: `{e}`")
-                send_email("Bot Alpaca SELL FAILED", f"{symbol}: {e}")
-                return
+        # ---- Send exit order to Alpaca ----
+        try:
+            order = self.api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side="sell",
+                type="market",
+                time_in_force="gtc"
+            )
+            print(f"Alpaca SELL sent: id={order.id}, status={order.status}")
+        except Exception as e:
+            print("❌ Alpaca SELL FAILED:", e)
+            send_telegram_message(f"❌ *SELL FAILED* for `{symbol}`\nReason: `{e}`")
+            send_email("Bot Sell Error", f"{symbol}: {e}")
+            return
 
-        # pnl calc (approx using our tracked prices)
+        # ---- Calculate PnL ----
         if side == "long":
             pnl = (exit_price - row["entry_price"]) * row["qty"]
         else:
             pnl = (row["entry_price"] - exit_price) * row["qty"]
 
+        # ---- Update record in DB ----
         df.loc[trade_index, "status"] = "closed"
-        df.loc[trade_index, "exit_price"] = exit_price
-        df.loc[trade_index, "pnl"] = pnl
+        df.loc[trade_index, "exit_price"] = float(exit_price)
+        df.loc[trade_index, "pnl"] = float(pnl)
         df.loc[trade_index, "reason"] = reason
-        self.save_trades(df)
 
-        sign = "✅" if pnl >= 0 else "⚠️"
+        # Save back to DB (replace entire table)
+        df.to_sql("trades", engine, if_exists="replace", index=False)
+
+        # ---- Alerts ----
+        status_emoji = "🟢" if pnl >= 0 else "⚠️"
+
         msg = (
-            f"{sign} *TRADE CLOSED* ({reason})\n"
+            f"{status_emoji} *TRADE CLOSED*\n"
             f"• Symbol: `{symbol}`\n"
-            f"• Side: *{side.upper()}*\n"
             f"• Qty: `{qty}`\n"
-            f"• Exit: `${exit_price:.2f}`\n"
-            f"• PnL: `${pnl:.2f}`"
+            f"• Exit Price: `${exit_price:.2f}`\n"
+            f"• Reason: `{reason}`\n"
+            f"• Profit/Loss: `${pnl:.2f}`"
         )
+
         print(msg)
         send_telegram_message(msg)
-        send_email("Bot closed Alpaca trade", msg)
+        send_email("Trade Closed", msg)
+
 
     def get_equity(self):
         try:
@@ -391,14 +408,24 @@ class AlpacaPaperBroker:
             return INITIAL_EQUITY_ASSUMED
 
     def log_equity(self):
+    # Get current equity from Alpaca
         equity = self.get_equity()
-        eq_df = pd.read_csv(self.equity_csv)
+
+        # UTC timestamp string
         ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        new_row = {"timestamp": ts, "equity": equity}
-        eq_df = pd.concat([eq_df, pd.DataFrame([new_row])], ignore_index=True)
-        eq_df.to_csv(self.equity_csv, index=False)
-        print(f"[EQUITY] {ts} => {equity:.2f}")
+
+        # Create one-row DataFrame
+        row = pd.DataFrame([{
+            "timestamp": ts,
+            "equity": float(equity),
+        }])
+
+        # Append to "equity" table in PostgreSQL
+        row.to_sql("equity", engine, if_exists="append", index=False)
+
+        print(f"[EQUITY LOGGED to DB] {ts} => {equity:.2f}")
         return equity
+
 
 
 # ==============================
