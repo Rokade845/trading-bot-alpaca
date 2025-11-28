@@ -3,7 +3,7 @@ import time
 import smtplib
 import requests
 from email.mime.text import MIMEText
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 import yfinance as yf
 import pandas as pd
@@ -33,7 +33,7 @@ SYMBOLS = ["AAPL", "MSFT", "GOOGL"]  # you can change/add
 
 DATA_LOOKBACK_DAYS = 365 * 3        # 3 years of history for model
 TRAIN_RATIO = 0.7
-PROB_THRESHOLD = 0.60               # min prob to go long
+PROB_THRESHOLD = 0.50               # LOWERED: min prob to go long
 
 STOP_LOSS_PCT = 0.02                # 2% SL
 TAKE_PROFIT_PCT = 0.04              # 4% TP
@@ -185,9 +185,27 @@ def train_model_and_signal(df: pd.DataFrame, prob_threshold=0.6):
     # Latest bar
     X_latest_scaled = scaler.transform(X[-1:].copy())
     prob_up_latest = model.predict_proba(X_latest_scaled)[:, 1][0]
-    latest_signal = int(prob_up_latest > prob_threshold)
 
     latest_row = df.iloc[-1].copy()
+    latest_signal = int(prob_up_latest > prob_threshold)
+
+    # ---------- FALLBACK LOGIC ----------
+    # 1) Force BUY if RSI14 is oversold
+    # ---------- FALLBACK LOGIC (fixed) ----------
+    if latest_signal == 0:
+        # Rule 1 — RSI Oversold
+        if float(latest_row["RSI14"]) < 30:
+            latest_signal = 1
+            print("⚠️ FORCED BUY — RSI14 < 30 (oversold)")
+
+        # Rule 2 — near-threshold probability + price above trend
+        elif (prob_up_latest > (prob_threshold - 0.08)) and (float(latest_row["Close"]) > float(latest_row["SMA50"])):
+            latest_signal = 1
+            print("📈 FORCED BUY — ProbUp borderline + Close > SMA50")
+
+        else:
+            print(f"⏸ No trade — ProbUp={prob_up_latest:.2%}, Threshold={prob_threshold:.2%}")
+
 
     return prob_up_latest, latest_signal, latest_row, acc
 
@@ -258,7 +276,7 @@ class AlpacaPaperBroker:
     # ----- Orders + logging -----
     def log_new_trade(self, symbol, side, qty, entry_price, stop_loss, take_profit, reason="entry"):
         qty = int(qty)
-        ts = datetime.utcnow().isoformat(timespec="seconds")
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         # Place Alpaca market order
         if side == "long":
@@ -375,7 +393,7 @@ class AlpacaPaperBroker:
     def log_equity(self):
         equity = self.get_equity()
         eq_df = pd.read_csv(self.equity_csv)
-        ts = datetime.utcnow().isoformat(timespec="seconds")
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         new_row = {"timestamp": ts, "equity": equity}
         eq_df = pd.concat([eq_df, pd.DataFrame([new_row])], ignore_index=True)
         eq_df.to_csv(self.equity_csv, index=False)
@@ -432,7 +450,7 @@ def maybe_send_daily_summary():
     if not TELEGRAM_ENABLED:
         return
 
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     today = now_utc.date()
 
     # Only after certain hour & only once per day
@@ -518,7 +536,7 @@ def maybe_send_heartbeat():
 
     msg = (
         f"💓 *BOT HEARTBEAT*\n"
-        f"• Time (UTC): `{datetime.utcnow().isoformat(timespec='seconds')}`\n"
+        f"• Time (UTC): `{datetime.now(timezone.utc).isoformat(timespec='seconds')}`\n"
         f"{eq_line}"
     )
     send_telegram_message(msg)
@@ -530,7 +548,7 @@ def maybe_send_heartbeat():
 # ==============================
 
 def run_cycle(symbols):
-    print("\n=== RUN CYCLE ===", datetime.utcnow().isoformat(timespec="seconds"))
+    print("\n=== RUN CYCLE ===", datetime.now(timezone.utc).isoformat(timespec="seconds"))
     broker = AlpacaPaperBroker()
 
     for symbol in symbols:
