@@ -34,7 +34,11 @@ DB_URL = os.getenv("DB_URL")
 engine = create_engine(DB_URL)
 
 # ---- Trading universe (US stocks supported by Alpaca) ----
-SYMBOLS = ["AAPL", "MSFT", "GOOGL"]  # you can change/add
+SYMBOLS = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META",
+    "TSLA", "NVDA", "NFLX", "AMD", "INTC"
+]
+  # you can change/add
 
 DATA_LOOKBACK_DAYS = 365 * 3        # 3 years of history for model
 TRAIN_RATIO = 0.7
@@ -339,18 +343,15 @@ class AlpacaPaperBroker:
         # Place Alpaca market order
         if side == "long":
             try:
-                order = self.api.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side="buy",
-                    type="market",
-                    time_in_force="gtc"
-                )
-                print(f"Alpaca BUY sent: id={order.id}, status={order.status}")
-            except Exception as e:
-                print("❌ Alpaca submit_order BUY FAILED:", e)
-                send_telegram_message(f"❌ *BUY FAILED* for `{symbol}`\nReason: `{e}`")
-                send_email("Bot Alpaca BUY FAILED", f"{symbol}: {e}")
+                account = self.api.get_account()
+                buying_power = float(account.buying_power)
+            except:
+                buying_power = 0
+
+            estimated_cost = entry_price * qty
+            if buying_power < estimated_cost:
+                print(f"❌ Not enough buying power for {symbol}. Needed: {estimated_cost:.2f}, Have: {buying_power:.2f}")
+                send_telegram_message(f"⚠️ Not enough buying power to open `{symbol}` trade (Need {estimated_cost:.2f}, Have {buying_power:.2f})")
                 return
         else:
             return  # (No short selling yet)
@@ -632,7 +633,14 @@ def run_cycle(symbols):
         print(f"\n[SYMBOL] {symbol}")
 
         # 1. Get history via yfinance (for ML features)
-        data = yf.download(symbol, period=f"{DATA_LOOKBACK_DAYS}d", interval="1d", progress=False)
+        data = yf.download(
+                symbol,
+               period=f"{DATA_LOOKBACK_DAYS}d",
+               interval="1d",
+               progress=False,
+             auto_adjust=True
+             )
+
         if data.empty:
             print("No data for", symbol)
             continue
@@ -678,19 +686,40 @@ def run_cycle(symbols):
                     open_trade = None
 
         # 5. Entry / exit by signal
+        # 5. Entry / exit by signal
         if signal == 1 and open_trade is None:
-            # New long
+            print(f"➡ Entry Signal Detected for {symbol}, checking buying power...")
+
             equity = broker.get_equity()
             risk_amount = equity * RISK_PER_TRADE_PCT
+
             sl_price = last_price * (1 - STOP_LOSS_PCT)
             tp_price = last_price * (1 + TAKE_PROFIT_PCT)
             per_share_risk = last_price - sl_price
+
             if per_share_risk <= 0:
-                print("Bad SL config; skipping entry.")
+                print("⚠️ Bad SL config; skipping entry.")
                 continue
 
             qty = max(int(risk_amount / per_share_risk), 1)
 
+            # ---- NEW BUYING POWER CHECK ----
+            try:
+                account = broker.api.get_account()
+                buying_power = float(account.buying_power)
+            except:
+                buying_power = 0
+
+            est_cost = last_price * qty
+
+            if buying_power < est_cost:
+                print(f"⚠️ Not enough buying power for {symbol}. Needed {est_cost:.2f} but only have {buying_power:.2f}. Trying next symbol...")
+                send_telegram_message(f"⚠️ Skipped `{symbol}` — insufficient buying power. (Need {est_cost:.2f}, Have {buying_power:.2f})")
+                continue  # 👉 moves to next symbol instead of stopping.
+
+            # ---- If affordable, place trade ----
+            print(f"🟢 Buying {symbol} qty={qty} at {last_price:.2f}")
+            
             broker.log_new_trade(
                 symbol=symbol,
                 side="long",
@@ -700,6 +729,7 @@ def run_cycle(symbols):
                 take_profit=tp_price,
                 reason="signal_long"
             )
+
 
         elif signal == 0 and open_trade is not None:
             trade_id = int(open_trade["id"])
@@ -734,3 +764,4 @@ def run_scheduler():
 if __name__ == "__main__":
     initialize_database()
     run_scheduler()
+
